@@ -10,7 +10,10 @@ const KV_NAMESPACE_NAME = process.env.KV_NAMESPACE_NAME || "moemail-kv";
 const DATABASE_ID = process.env.DATABASE_ID;
 
 const client = new Cloudflare({
-  apiKey: CF_API_TOKEN,
+  apiToken: CF_API_TOKEN,
+  // Use Node's global fetch so NODE_USE_ENV_PROXY=1 routes API calls
+  // through the egress proxy (required for the surrogate token swap).
+  fetch: fetch as any,
 });
 
 export const getPages = async () => {
