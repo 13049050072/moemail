@@ -1,40 +1,50 @@
 import { Env } from '../types'
-import { drizzle } from 'drizzle-orm/d1'
-import { messages, emails, webhooks } from '../app/lib/schema'
-import { eq, sql } from 'drizzle-orm'
 import PostalMime from 'postal-mime'
 import { WEBHOOK_CONFIG } from '../app/config/webhook'
 import { EmailMessage } from '../app/lib/webhook'
 
 const handleEmail = async (message: ForwardableEmailMessage, env: Env) => {
-  const db = drizzle(env.DB, { schema: { messages, emails, webhooks } })
-
-  const parsedMessage = await PostalMime.parse(message.raw)
-
-  console.log("parsedMessage:", parsedMessage)
-
   try {
-    const targetEmail = await db.query.emails.findFirst({
-      where: eq(sql`LOWER(${emails.address})`, message.to.toLowerCase())
-    })
+    // 1. 先查邮箱是否存在：不存在直接丢弃，跳过 MIME 解析。
+    //    catch-all 下发到不存在地址的垃圾邮件是 CPU 超限的大头——解析一封
+    //    HTML 邮件要 10-30ms，而一次查库只要 1-2ms。
+    const targetEmail = await env.DB.prepare(
+      'SELECT id, userId, address FROM email WHERE LOWER(address) = ? LIMIT 1'
+    )
+      .bind(message.to.toLowerCase())
+      .first<{ id: string; userId: string | null; address: string }>()
 
     if (!targetEmail) {
       console.error(`Email not found: ${message.to}`)
       return
     }
 
-    const savedMessage = await db.insert(messages).values({
-      emailId: targetEmail.id,
-      fromAddress: message.from,
-      subject: parsedMessage.subject || '(无主题)',
-      content: parsedMessage.text || '',
-      html: parsedMessage.html || '',
-      type: 'received',
-    }).returning().get()
+    // 2. 邮箱存在才解析正文。
+    const parsedMessage = await PostalMime.parse(message.raw)
 
-    const webhook = await db.query.webhooks.findFirst({
-      where: eq(webhooks.userId, targetEmail!.userId!)
-    })
+    const now = Date.now()
+    const messageId = crypto.randomUUID()
+    await env.DB.prepare(
+      `INSERT INTO message (id, emailId, from_address, subject, content, html, type, received_at, sent_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'received', ?, ?)`
+    )
+      .bind(
+        messageId,
+        targetEmail.id,
+        message.from,
+        parsedMessage.subject || '(无主题)',
+        parsedMessage.text || '',
+        parsedMessage.html || '',
+        now,
+        now
+      )
+      .run()
+
+    const webhook = await env.DB.prepare(
+      'SELECT url, enabled FROM webhook WHERE user_id = ? LIMIT 1'
+    )
+      .bind(targetEmail.userId)
+      .first<{ url: string; enabled: number }>()
 
     if (webhook?.enabled) {
       try {
@@ -46,12 +56,12 @@ const handleEmail = async (message: ForwardableEmailMessage, env: Env) => {
           },
           body: JSON.stringify({
             emailId: targetEmail.id,
-            messageId: savedMessage.id,
-            fromAddress: savedMessage.fromAddress,
-            subject: savedMessage.subject,
-            content: savedMessage.content,
-            html: savedMessage.html,
-            receivedAt: savedMessage.receivedAt.toISOString(),
+            messageId,
+            fromAddress: message.from,
+            subject: parsedMessage.subject || '(无主题)',
+            content: parsedMessage.text || '',
+            html: parsedMessage.html || '',
+            receivedAt: new Date(now).toISOString(),
             toAddress: targetEmail.address
           } as EmailMessage)
         })
@@ -72,4 +82,4 @@ const worker = {
   }
 }
 
-export default worker 
+export default worker
